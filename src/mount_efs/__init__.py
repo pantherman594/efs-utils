@@ -98,7 +98,19 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
 UBUNTU_24_RELEASE = "Ubuntu 24"
 
 CLONE_NEWNET = 0x40000000
-CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
+
+# User-space mode: use fuse-nfs instead of mount.nfs4, no root required
+FUSE_MODE = os.environ.get("EFS_FUSE_MODE", "").lower() in ("1", "true", "yes")
+
+# Config file path - user-space in fuse mode
+if FUSE_MODE:
+    _USER_EFS_DIR = os.path.expanduser("~/.efs")
+    CONFIG_FILE = os.path.join(_USER_EFS_DIR, "efs-utils.conf")
+    # Fallback to system config if user config doesn't exist
+    if not os.path.exists(CONFIG_FILE):
+        CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
+else:
+    CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
 CONFIG_SECTION = "mount"
 CLIENT_INFO_SECTION = "client-info"
 CLIENT_SOURCE_STR_LEN_LIMIT = 100
@@ -123,12 +135,17 @@ INSTANCE_AZ_ID_METADATA = None
 RETRYABLE_ERRORS = ["reset by peer"]
 OPTIMIZE_READAHEAD_ITEM = "optimize_readahead"
 
-LOG_DIR = "/var/log/amazon/efs"
+# Default paths - overridden in fuse mode
+if FUSE_MODE:
+    LOG_DIR = os.path.join(_USER_EFS_DIR, "log")
+    STATE_FILE_DIR = os.path.join(_USER_EFS_DIR, "run")
+    PRIVATE_KEY_FILE = os.path.join(_USER_EFS_DIR, "privateKey.pem")
+else:
+    LOG_DIR = "/var/log/amazon/efs"
+    STATE_FILE_DIR = "/var/run/efs"
+    PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
+
 LOG_FILE = "mount.log"
-
-STATE_FILE_DIR = "/var/run/efs"
-
-PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
 DATE_ONLY_FORMAT = "%Y%m%d"
 SIGV4_DATETIME_FORMAT = "%Y%m%dT%H%M%SZ"
 CERT_DATETIME_FORMAT = "%y%m%d%H%M%SZ"
@@ -1492,7 +1509,7 @@ def write_stunnel_config_file(
         # Only support in stunnel version 5.25+.
         global_config["foreground"] = "quiet"
 
-    if any(
+    if FUSE_MODE or any(
         release in system_release_version
         for release in SKIP_NO_SO_BINDTODEVICE_RELEASES
     ):
@@ -2129,7 +2146,24 @@ def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=N
 
     nfs_options = get_nfs_mount_options(options, config)
 
-    if not check_if_platform_is_mac():
+    # Fuse mode: use fuse-nfs instead of mount.nfs4 (no root required)
+    if FUSE_MODE:
+        # Get the port from options (set by bootstrap_proxy)
+        tls_port = options.get("port", options.get("tlsport", "2049"))
+        # Build fuse-nfs URL (nfsport is the libnfs parameter for NFS server port)
+        # version=4 is required for EFS (NFSv4.1)
+        nfs_url = "nfs://127.0.0.1%s?nfsport=%s&version=4" % (path, tls_port)
+        # Get current user's uid/gid for ownership mapping
+        uid = os.getuid()
+        gid = os.getgid()
+        command = [
+            "fuse-nfs",
+            "-n", nfs_url,
+            "-m", mountpoint,
+            "--uid", str(uid),
+            "--gid", str(gid),
+        ]
+    elif not check_if_platform_is_mac():
         command = [
             "/sbin/mount.nfs4",
             mount_path,
@@ -2702,9 +2736,21 @@ def get_utc_now():
 
 
 def assert_root():
+    # In fuse mode, we don't need root
+    if FUSE_MODE:
+        return
     if os.geteuid() != 0:
         sys.stderr.write("only root can run mount.efs\n")
         sys.exit(1)
+
+
+def ensure_fuse_mode_dirs():
+    """Create user directories for fuse mode."""
+    if not FUSE_MODE:
+        return
+    for dir_path in [LOG_DIR, STATE_FILE_DIR, os.path.dirname(PRIVATE_KEY_FILE)]:
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path, mode=0o750, exist_ok=True)
 
 
 def read_config(config_file=CONFIG_FILE):
@@ -4188,6 +4234,7 @@ def main():
     parse_arguments_early_exit()
 
     assert_root()
+    ensure_fuse_mode_dirs()
 
     config = read_config()
     bootstrap_logging(config)

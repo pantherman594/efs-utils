@@ -59,7 +59,24 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
 VERSION = "2.4.1"
 SERVICE = "elasticfilesystem"
 
-CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
+# User-space mode: use fuse-nfs instead of mount.nfs4, no root required
+FUSE_MODE = os.environ.get("EFS_FUSE_MODE", "").lower() in ("1", "true", "yes")
+
+# Config file path - user-space in fuse mode
+if FUSE_MODE:
+    _USER_EFS_DIR = os.path.expanduser("~/.efs")
+    CONFIG_FILE = os.path.join(_USER_EFS_DIR, "efs-utils.conf")
+    if not os.path.exists(CONFIG_FILE):
+        CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
+    LOG_DIR = os.path.join(_USER_EFS_DIR, "log")
+    STATE_FILE_DIR = os.path.join(_USER_EFS_DIR, "run")
+    PRIVATE_KEY_FILE = os.path.join(_USER_EFS_DIR, "privateKey.pem")
+else:
+    CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
+    LOG_DIR = "/var/log/amazon/efs"
+    STATE_FILE_DIR = "/var/run/efs"
+    PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
+
 CONFIG_SECTION = "mount-watchdog"
 MOUNT_CONFIG_SECTION = "mount"
 CLIENT_INFO_SECTION = "client-info"
@@ -70,14 +87,11 @@ DEFAULT_MACOS_VALUE = "macos"
 # 50ms
 DEFAULT_TIMEOUT = 0.05
 
-LOG_DIR = "/var/log/amazon/efs"
 LOG_FILE = "mount-watchdog.log"
 
-STATE_FILE_DIR = "/var/run/efs"
 STUNNEL_PID_FILE = "stunnel.pid"
 
 DEFAULT_NFS_PORT = "2049"
-PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
 DEFAULT_REFRESH_SELF_SIGNED_CERT_INTERVAL_MIN = 60
 DEFAULT_STUNNEL_HEALTH_CHECK_INTERVAL_MIN = 5
 DEFAULT_STUNNEL_HEALTH_CHECK_TIMEOUT_SEC = 30
@@ -787,7 +801,11 @@ def get_current_local_nfs_mounts(mount_file="/proc/mounts"):
         else:
             logging.warning("No nfs mounts found")
 
-    mounts = [m for m in mounts if m.server.startswith("127.0.0.1") and "nfs" in m.type]
+    # Filter for NFS mounts, or fuse mounts in fuse mode
+    if FUSE_MODE:
+        mounts = [m for m in mounts if m.server.startswith("127.0.0.1") and ("nfs" in m.type or "fuse" in m.type)]
+    else:
+        mounts = [m for m in mounts if m.server.startswith("127.0.0.1") and "nfs" in m.type]
 
     mount_dict = {}
     for m in mounts:
